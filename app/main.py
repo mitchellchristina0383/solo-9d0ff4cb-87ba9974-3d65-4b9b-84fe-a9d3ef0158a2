@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from fastapi import Depends, FastAPI, Query
 from fastapi.encoders import jsonable_encoder
@@ -10,7 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from . import db, services
-from .analysis import build_inventory_view, load_snapshot, pending_cleanup_map
+from .analysis import build_inventory_view, load_snapshot, pending_cleanup_map, rebuild_slot_map
 from .config import Settings
 from .errors import Conflict, DrillError
 from .lsn import format_lsn
@@ -19,6 +19,9 @@ from .schemas import (
     PauseSubscriptionRequest,
     PreviewConfirmRequest,
     PreviewRequest,
+    RebuildAbortRequest,
+    RebuildOrderCreate,
+    RebuildReceiptRequest,
     SlotPatch,
     SlotUpsert,
     SubscriptionPatch,
@@ -72,6 +75,7 @@ app = FastAPI(
         {"name": "演练入口", "description": "开始前先看 GET /api/inventory；本页可直接点 Try it out 操作。"},
         {"name": "库存录入", "description": "录入/修正 WAL 边界、复制槽与订阅确认位点。"},
         {"name": "槽清理", "description": "预览 → 确认。确认需回传预览指纹；任何漂移整次拒绝。"},
+        {"name": "槽重建", "description": "lost 逻辑槽的重建单：开单建新槽 → 提交回执 → 位点吻合原子换绑；可中止。"},
         {"name": "故障注入", "description": "注入订阅停顿/恢复、清理失败、提交前崩溃，用于演练演示。"},
         {"name": "状态", "description": "查询占用来源、待清理状态、阻断原因与事件流。"},
     ],
@@ -149,7 +153,7 @@ def update_cluster(payload: ClusterUpdate, conn: sqlite3.Connection = Depends(ge
 @app.get("/api/inventory", tags=["演练入口", "状态"])
 def inventory(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
     snapshot = load_snapshot(conn)
-    view = build_inventory_view(snapshot, pending_cleanup_map(conn))
+    view = build_inventory_view(snapshot, pending_cleanup_map(conn), rebuild_slot_map(conn))
     view["faults"] = services.state_document(conn)["faults"]
     return view
 
@@ -243,6 +247,66 @@ def confirm_preview(
 
 
 # ---------------------------------------------------------------------------
+# Rebuild orders (lost logical slot rebuild)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/rebuild-orders", status_code=201, tags=["槽重建"])
+def open_rebuild_order(
+    payload: RebuildOrderCreate, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """开重建单。
+
+    前置条件：订阅停顿（stalled）且其逻辑槽 ``wal_status='lost'``。开单时记下
+    当前 WAL 边界作为全量快照位点，新建逻辑槽从该位点起保留 WAL；同一订阅
+    最多一单在办。在办期间新槽禁止改写/删除/绑定，原订阅维持停顿与原绑定。
+    """
+    return services.open_rebuild_order(
+        conn, payload.subscription_name, payload.new_slot_name, payload.note
+    )
+
+
+@app.get("/api/rebuild-orders", tags=["槽重建"])
+def list_rebuild_orders(
+    status: Literal["open", "completed", "aborted"] | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> list[dict[str, Any]]:
+    """列出重建单；重启后在办单仍可查询与续办。"""
+    return services.list_rebuild_orders(conn, status, limit)
+
+
+@app.get("/api/rebuild-orders/{order_id}", tags=["槽重建"])
+def read_rebuild_order(order_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    return services.get_rebuild_order(conn, order_id)
+
+
+@app.post("/api/rebuild-orders/{order_id}/receipt", tags=["槽重建"])
+def submit_rebuild_receipt(
+    order_id: str,
+    payload: RebuildReceiptRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """提交模拟复制完成的回执。
+
+    ``snapshot_lsn`` 与开单快照位点吻合时，单事务内原子换绑、按快照位点恢复
+    在线并结单，原槽留在库存；不符返回 409，单仍在办可重报；已结单的回执
+    幂等返回，不再改动库存。
+    """
+    return services.submit_rebuild_receipt(conn, order_id, payload.snapshot_lsn, payload.note)
+
+
+@app.post("/api/rebuild-orders/{order_id}/abort", tags=["槽重建"])
+def abort_rebuild_order(
+    order_id: str,
+    payload: RebuildAbortRequest | None = None,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """中止重建单：释放新槽，原订阅继续停顿、保留原绑定与确认位点。"""
+    return services.abort_rebuild_order(conn, order_id, payload.note if payload else None)
+
+
+# ---------------------------------------------------------------------------
 # Fault injection / demo
 # ---------------------------------------------------------------------------
 
@@ -322,12 +386,13 @@ def demo_reset(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
 @app.get("/api/state", tags=["状态"])
 def state(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
     doc = services.state_document(conn)
-    inventory_view = build_inventory_view(load_snapshot(conn), doc["pending_cleanup"])
+    inventory_view = build_inventory_view(load_snapshot(conn), doc["pending_cleanup"], doc["rebuild_slots"])
     return {
         "cluster": doc["cluster"],
         "faults": doc["faults"],
         "inventory": inventory_view,
         "pending_cleanup": doc["pending_cleanup"],
+        "rebuild_orders_open": doc["rebuild_orders_open"],
         "events": doc["events"],
     }
 
@@ -445,7 +510,28 @@ DEMO_HTML = r"""<!doctype html>
   </section>
 
   <section class="wide">
-    <h2>4. 请求日志</h2>
+    <h2>4. 槽重建单（lost 逻辑槽 → 新槽 → 回执换绑）</h2>
+    <div class="row">
+      <label>停顿订阅</label>
+      <select id="rebuildSubSelect"></select>
+      <label>新槽名</label>
+      <input id="rebuildNewSlot" placeholder="slot_reports_v2" size="24">
+      <button class="primary" onclick="openRebuild()">开重建单</button>
+      <button onclick="loadRebuildOrders()">刷新单列表</button>
+    </div>
+    <table id="orders"><thead><tr>
+      <th>单号</th><th>订阅</th><th>原槽 → 新槽</th><th>快照位点</th><th>状态</th><th>操作</th>
+    </tr></thead><tbody></tbody></table>
+    <p class="muted" style="margin:10px 0 0">
+      演示路径：开单（记下当前 WAL 边界为快照位点，新槽从该位点起保留 WAL）→
+      改 WAL 边界（前推时新槽占用增长；回退越过快照位点被 409 拒绝）→
+      提交错误位点回执（409，可重报）→ 提交正确位点回执（原子换绑、按快照位点恢复在线、
+      结单，原槽留在库存）。中止则释放新槽，原订阅继续停顿。
+    </p>
+  </section>
+
+  <section class="wide">
+    <h2>5. 请求日志</h2>
     <pre id="log" class="muted">等待操作…</pre>
   </section>
 </main>
@@ -474,7 +560,8 @@ const short = (v) => v ? String(v).slice(0, 10) + '…' : '—';
 
 function statusPill(s) {
   const map = { preview:'warn', applying:'warn', completed:'ok', failed:'bad',
-                rejected:'bad', expired:'warn', cancelled:'muted' };
+                rejected:'bad', expired:'warn', cancelled:'muted',
+                open:'warn', aborted:'muted' };
   return `<span class="pill ${map[s] || 'muted'}">${esc(s)}</span>`;
 }
 
@@ -497,8 +584,11 @@ async function loadInventory() {
     const pending = s.pending_cleanup
       ? `<span class="pill warn">${esc(s.pending_cleanup.status)}</span><br><code>${esc(short(s.pending_cleanup.preview_id))}</code>`
       : '<span class="muted">—</span>';
+    const rebuild = s.rebuild_order
+      ? `<br><span class="pill warn" title="${esc(s.rebuild_order.role)}">重建单 ${esc(s.rebuild_order.order_id)}</span>`
+      : '';
     return `<tr>
-      <td><strong>${esc(s.name)}</strong><br><span class="muted">${esc(s.slot_type)} / ${esc(s.wal_status)}</span></td>
+      <td><strong>${esc(s.name)}</strong>${rebuild}<br><span class="muted">${esc(s.slot_type)} / ${esc(s.wal_status)}</span></td>
       <td><code>${esc(s.restart_lsn)}</code><br><span class="muted">${esc(s.occupancy.retained_human)} · active=${s.active} disabled=${s.disabled}</span></td>
       <td>${refs}</td><td>${judge}</td><td>${pending}</td></tr>`;
   }).join('');
@@ -509,6 +599,12 @@ async function loadInventory() {
     const old = $(id).value; $(id).innerHTML = opts;
     if (old) $(id).value = old;
   }
+  const stalled = (data.subscriptions || []).filter(s => s.status === 'stalled');
+  const oldSub = $('rebuildSubSelect').value;
+  $('rebuildSubSelect').innerHTML = stalled.length
+    ? stalled.map(s => `<option value="${esc(s.name)}">${esc(s.name)}（${esc(s.slot_name)}）</option>`).join('')
+    : '<option value="">（无停顿订阅）</option>';
+  if (oldSub) $('rebuildSubSelect').value = oldSub;
 }
 
 function renderPreview(p) {
@@ -604,8 +700,62 @@ async function resetDemo() {
   await api('POST', '/api/demo/reset');
   currentPreview = null; $('previewBox').textContent = '演示数据已重置。';
   await loadInventory();
+  await loadRebuildOrders();
+}
+
+function lsnShift(lsn, delta) {
+  const n = BigInt('0x' + lsn.replace('/', '')) + delta;
+  return (n >> 32n).toString(16).toUpperCase() + '/' + (n & 0xffffffffn).toString(16).toUpperCase();
+}
+
+async function loadRebuildOrders() {
+  const { data } = await api('GET', '/api/rebuild-orders');
+  const tbody = $('orders').querySelector('tbody');
+  if (!data || !data.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无重建单</td></tr>';
+    return;
+  }
+  tbody.innerHTML = data.map(o => {
+    const actions = o.status === 'open'
+      ? `<button class="primary" onclick="submitReceipt('${o.id}', true)">提交回执（正确位点）</button>` +
+        `<button onclick="submitReceipt('${o.id}', false)">提交回执（错误位点）</button>` +
+        `<button class="danger" onclick="abortOrder('${o.id}')">中止</button>`
+      : '<span class="muted">已结单</span>';
+    const mismatch = o.mismatch_count ? `<br><span class="muted">位点不符重报 ${o.mismatch_count} 次</span>` : '';
+    return `<tr>
+      <td><code>${esc(o.id)}</code></td>
+      <td>${esc(o.subscription_name)}</td>
+      <td><code>${esc(o.source_slot_name)}</code> → <code>${esc(o.new_slot_name)}</code></td>
+      <td><code>${esc(o.snapshot_lsn)}</code></td>
+      <td>${statusPill(o.status)}${mismatch}</td>
+      <td>${actions}</td></tr>`;
+  }).join('');
+}
+async function openRebuild() {
+  const sub = $('rebuildSubSelect').value;
+  const newSlot = $('rebuildNewSlot').value.trim();
+  if (!sub || !newSlot) return log('开单参数不全', { sub, newSlot });
+  await api('POST', '/api/rebuild-orders',
+    { subscription_name: sub, new_slot_name: newSlot, note: 'demo console' });
+  await loadRebuildOrders();
+  await loadInventory();
+}
+async function submitReceipt(orderId, correct) {
+  const { data: order } = await api('GET', `/api/rebuild-orders/${orderId}`);
+  if (!order || !order.id) return;
+  const lsn = correct ? order.snapshot_lsn : lsnShift(order.snapshot_lsn, -0x100000n);
+  await api('POST', `/api/rebuild-orders/${orderId}/receipt`,
+    { snapshot_lsn: lsn, note: correct ? '复制完成（演示）' : '故意上报错误位点（演示）' });
+  await loadRebuildOrders();
+  await loadInventory();
+}
+async function abortOrder(orderId) {
+  await api('POST', `/api/rebuild-orders/${orderId}/abort`, { note: 'demo abort' });
+  await loadRebuildOrders();
+  await loadInventory();
 }
 loadInventory();
+loadRebuildOrders();
 </script>
 </body>
 </html>

@@ -161,7 +161,13 @@ def subscriptions_by_slot(snapshot: dict[str, Any]) -> dict[str, list[dict[str, 
     return grouped
 
 
-def slot_view(slot: dict[str, Any], boundary: int, subs: list[dict[str, Any]]) -> dict[str, Any]:
+def slot_view(
+    slot: dict[str, Any],
+    boundary: int,
+    subs: list[dict[str, Any]],
+    *,
+    rebuild: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     restart = int(slot["restart_lsn"])
     confirmed = slot["confirmed_flush_lsn"]
     confirmed = int(confirmed) if confirmed is not None else None
@@ -202,6 +208,14 @@ def slot_view(slot: dict[str, Any], boundary: int, subs: list[dict[str, Any]]) -
                 "source": "slots.restart_lsn/confirmed_flush_lsn",
             }
         )
+    if rebuild and rebuild.get("role") == "new_slot":
+        blocking.append(
+            {
+                "code": "reserved_by_rebuild_order",
+                "message": f"槽是在办重建单 {rebuild['order_id']} 的新槽，在办期间禁止改写/删除/绑定",
+                "source": f"rebuild_orders.{rebuild['order_id']}",
+            }
+        )
 
     eligible = not blocking
     return {
@@ -237,6 +251,7 @@ def slot_view(slot: dict[str, Any], boundary: int, subs: list[dict[str, Any]]) -
         "eligible": eligible,
         "blocking_reasons": blocking,
         "invalid_position": invalid,
+        "rebuild_order": rebuild,
         "_restart_raw": restart,
         "_confirmed_raw": confirmed,
     }
@@ -290,13 +305,15 @@ def reclaim_estimate(
 def build_inventory_view(
     snapshot: dict[str, Any],
     pending_map: dict[str, dict[str, Any]] | None = None,
+    rebuild_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     boundary = snapshot["wal_boundary_lsn"]
     grouped = subscriptions_by_slot(snapshot)
     pending_map = pending_map or {}
+    rebuild_map = rebuild_map or {}
     views = []
     for slot in snapshot["slots"]:
-        view = slot_view(slot, boundary, grouped.get(slot["name"], []))
+        view = slot_view(slot, boundary, grouped.get(slot["name"], []), rebuild=rebuild_map.get(slot["name"]))
         view["pending_cleanup"] = pending_map.get(slot["name"])
         views.append(view)
     estimate = reclaim_estimate(views, boundary, selected=None)
@@ -370,6 +387,32 @@ def build_cleanup_plan(
         "after_cleanup_earliest": estimate["after_cleanup_earliest"],
         "note": estimate["note"],
     }
+
+
+def rebuild_slot_map(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Open rebuild orders annotated by the slot names they involve.
+
+    The *new* slot is reserved by the order (no edits/deletes/rebinding); the
+    *source* slot keeps its stalled subscription until the receipt matches.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, subscription_name, source_slot_name, new_slot_name, snapshot_lsn, created_at
+        FROM rebuild_orders
+        WHERE status = 'open'
+        ORDER BY created_at, id
+        """
+    ).fetchall()
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        base = {
+            "order_id": row["id"],
+            "subscription": row["subscription_name"],
+            "snapshot_lsn": format_lsn(int(row["snapshot_lsn"])),
+        }
+        result[row["new_slot_name"]] = {**base, "role": "new_slot"}
+        result[row["source_slot_name"]] = {**base, "role": "source_slot"}
+    return result
 
 
 def pending_cleanup_map(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:

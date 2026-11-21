@@ -114,9 +114,9 @@ def test_subscription_validation(demo):
 
 def test_inventory_exposes_blocking_reasons_and_occupancy(demo):
     inventory = demo.get("/api/inventory").json()
-    assert inventory["summary"]["slot_count"] == 5
+    assert inventory["summary"]["slot_count"] == 6
     assert inventory["summary"]["eligible_count"] == 2
-    assert inventory["summary"]["blocked_count"] == 3
+    assert inventory["summary"]["blocked_count"] == 4
     for slot in inventory["slots"]:
         assert slot["occupancy"]["source"] == "restart_lsn"
         if not slot["eligible"]:
@@ -386,7 +386,7 @@ def test_state_endpoint_exposes_events_and_faults(demo):
     event_types = [event["event_type"] for event in state["events"]]
     assert "wal_boundary_updated" in event_types
     assert "fault_injected" in event_types
-    assert state["inventory"]["summary"]["slot_count"] == 5
+    assert state["inventory"]["summary"]["slot_count"] == 6
 
 
 # ---------------------------------------------------------------------------

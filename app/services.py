@@ -15,6 +15,7 @@ from .analysis import (
     fingerprint_snapshot,
     load_snapshot,
     pending_cleanup_map,
+    rebuild_slot_map,
 )
 from .config import Settings
 from .errors import Conflict, DrillError, NotFound
@@ -42,6 +43,45 @@ def _touch(conn: sqlite3.Connection, now: int, reason: str, event_type: str) -> 
 
 
 # ---------------------------------------------------------------------------
+# Rebuild-order guards (enforced on the generic inventory write paths)
+# ---------------------------------------------------------------------------
+
+
+def _open_order_for_subscription(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM rebuild_orders WHERE subscription_name = ? AND status = 'open'", (name,)
+    ).fetchone()
+
+
+def _open_order_for_new_slot(conn: sqlite3.Connection, slot_name: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM rebuild_orders WHERE new_slot_name = ? AND status = 'open'", (slot_name,)
+    ).fetchone()
+
+
+def _assert_slot_not_reserved(conn: sqlite3.Connection, slot_name: str) -> None:
+    """在办重建单的新槽：现有接口不得改写、删除或把它绑给其他订阅。"""
+    row = _open_order_for_new_slot(conn, slot_name)
+    if row is not None:
+        raise Conflict(
+            "slot_reserved_by_rebuild",
+            f"槽 {slot_name} 是在办重建单 {row['id']} 的新槽，在办期间禁止改写、删除或绑定",
+            order_id=row["id"],
+        )
+
+
+def _assert_subscription_not_rebuilding(conn: sqlite3.Connection, name: str) -> None:
+    """在办期间原订阅维持停顿，保留原绑定和确认位点，禁止改动。"""
+    row = _open_order_for_subscription(conn, name)
+    if row is not None:
+        raise Conflict(
+            "subscription_rebuild_in_progress",
+            f"订阅 {name} 有在办重建单 {row['id']}，在办期间保持停顿与原绑定，禁止改动",
+            order_id=row["id"],
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cluster / inventory edits
 # ---------------------------------------------------------------------------
 
@@ -52,6 +92,20 @@ def update_cluster_boundary(conn: sqlite3.Connection, lsn: str, *, actor: str = 
         row = conn.execute("SELECT wal_boundary_lsn FROM cluster WHERE id = 1").fetchone()
         before = int(row["wal_boundary_lsn"])
         new_value = parse_lsn(lsn)
+        # 在办重建单的快照位点是 WAL 边界回退的下限：新槽从该位点起保留
+        # WAL，边界若退到它之前，快照位点之前的 WAL 可能已被回收，重建单
+        # 的全量快照就失去了依据。前推不受限。
+        floor_row = conn.execute(
+            "SELECT MAX(snapshot_lsn) AS floor FROM rebuild_orders WHERE status = 'open'"
+        ).fetchone()
+        floor = floor_row["floor"]
+        if floor is not None and new_value < int(floor):
+            raise Conflict(
+                "boundary_below_snapshot",
+                "WAL 边界回退不得越过在办重建单的快照位点",
+                min_boundary_lsn=format_lsn(int(floor)),
+                requested_lsn=format_lsn(new_value),
+            )
         conn.execute(
             "UPDATE cluster SET wal_boundary_lsn = ?, updated_at = ? WHERE id = 1",
             (new_value, now),
@@ -112,6 +166,7 @@ def update_slot(conn: sqlite3.Connection, name: str, patch: dict[str, Any]) -> d
         row = conn.execute("SELECT * FROM slots WHERE name = ?", (name,)).fetchone()
         if row is None:
             raise NotFound(f"槽 {name} 不存在")
+        _assert_slot_not_reserved(conn, name)
         merged = dict(row)
         for key, value in patch.items():
             if key in {"restart_lsn", "confirmed_flush_lsn"} and value is not None:
@@ -149,6 +204,7 @@ def delete_slot_direct(conn: sqlite3.Connection, name: str) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM slots WHERE name = ?", (name,)).fetchone()
         if row is None:
             raise NotFound(f"槽 {name} 不存在")
+        _assert_slot_not_reserved(conn, name)
         if row["active"]:
             raise Conflict("slot_active", "槽仍为 active，不能删除")
         if not row["disabled"]:
@@ -175,7 +231,11 @@ def get_slot(conn: sqlite3.Connection, name: str) -> dict[str, Any]:
         raise NotFound(f"槽 {name} 不存在")
     from .analysis import build_inventory_view
 
-    view = next(v for v in build_inventory_view(load_snapshot(conn))["slots"] if v["name"] == name)
+    view = next(
+        v
+        for v in build_inventory_view(load_snapshot(conn), rebuild_map=rebuild_slot_map(conn))["slots"]
+        if v["name"] == name
+    )
     return view
 
 
@@ -198,6 +258,7 @@ def create_subscription(conn: sqlite3.Connection, payload: dict[str, Any]) -> di
             ).fetchone()
             if slot is None:
                 raise Conflict("slot_missing", f"槽 {payload['slot_name']} 不存在")
+            _assert_slot_not_reserved(conn, payload["slot_name"])
         conn.execute(
             """
             INSERT INTO subscriptions (name, slot_name, status, confirmed_lsn, note, updated_at)
@@ -226,6 +287,7 @@ def get_subscription(conn: sqlite3.Connection, name: str) -> dict[str, Any]:
 def subscription_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     boundary = int(conn.execute("SELECT wal_boundary_lsn FROM cluster WHERE id = 1").fetchone()["wal_boundary_lsn"])
     confirmed = int(row["confirmed_lsn"])
+    open_order = _open_order_for_subscription(conn, row["name"])
     return {
         "name": row["name"],
         "slot_name": row["slot_name"],
@@ -233,6 +295,7 @@ def subscription_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, A
         "confirmed_lsn": format_lsn(confirmed),
         "lag_bytes": max(0, boundary - confirmed),
         "blocks_slot_cleanup": row["status"] != "disabled",
+        "open_rebuild_order_id": open_order["id"] if open_order is not None else None,
         "note": row["note"],
     }
 
@@ -243,6 +306,7 @@ def update_subscription(conn: sqlite3.Connection, name: str, patch: dict[str, An
         row = conn.execute("SELECT * FROM subscriptions WHERE name = ?", (name,)).fetchone()
         if row is None:
             raise NotFound(f"订阅 {name} 不存在")
+        _assert_subscription_not_rebuilding(conn, name)
         merged = dict(row)
         for key in ("slot_name", "status", "confirmed_lsn", "note"):
             if key in patch:
@@ -258,6 +322,7 @@ def update_subscription(conn: sqlite3.Connection, name: str, patch: dict[str, An
             slot = conn.execute("SELECT name FROM slots WHERE name = ?", (merged["slot_name"],)).fetchone()
             if slot is None:
                 raise Conflict("slot_missing", f"槽 {merged['slot_name']} 不存在")
+            _assert_slot_not_reserved(conn, merged["slot_name"])
         conn.execute(
             """
             UPDATE subscriptions SET slot_name = ?, status = ?, confirmed_lsn = ?, note = ?, updated_at = ?
@@ -306,6 +371,7 @@ def pause_subscription(conn: sqlite3.Connection, name: str, note: str | None = N
             raise NotFound(f"订阅 {name} 不存在")
         if row["status"] == "disabled":
             raise Conflict("subscription_disabled", "已停用的订阅不能注入停顿")
+        _assert_subscription_not_rebuilding(conn, name)
         conn.execute(
             "UPDATE subscriptions SET status = 'stalled', note = COALESCE(?, note), updated_at = ? WHERE name = ?",
             (note, now, name),
@@ -322,6 +388,7 @@ def resume_subscription(conn: sqlite3.Connection, name: str) -> dict[str, Any]:
             raise NotFound(f"订阅 {name} 不存在")
         if row["status"] == "disabled":
             raise Conflict("subscription_disabled", "已停用的订阅不能恢复")
+        _assert_subscription_not_rebuilding(conn, name)
         conn.execute(
             "UPDATE subscriptions SET status = 'online', updated_at = ? WHERE name = ?", (now, name)
         )
@@ -354,6 +421,312 @@ def _cleanup_failure_slots(conn: sqlite3.Connection) -> set[str]:
         return set(json.loads(row["value"]))
     except (TypeError, ValueError):
         return set()
+
+
+# ---------------------------------------------------------------------------
+# Rebuild orders: lost logical slot -> new slot -> receipt -> atomic rebind
+# ---------------------------------------------------------------------------
+
+
+def _rebuild_order_row(conn: sqlite3.Connection, order_id: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM rebuild_orders WHERE id = ?", (order_id,)).fetchone()
+    if row is None:
+        raise NotFound(f"重建单 {order_id} 不存在")
+    return row
+
+
+def _rebuild_order_view(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    sub = conn.execute(
+        "SELECT * FROM subscriptions WHERE name = ?", (row["subscription_name"],)
+    ).fetchone()
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "subscription_name": row["subscription_name"],
+        "source_slot_name": row["source_slot_name"],
+        "new_slot_name": row["new_slot_name"],
+        "snapshot_lsn": format_lsn(int(row["snapshot_lsn"])),
+        "mismatch_count": int(row["mismatch_count"]),
+        "receipt_lsn": format_lsn(int(row["receipt_lsn"])) if row["receipt_lsn"] is not None else None,
+        "created_at": int(row["created_at"]),
+        "closed_at": row["closed_at"],
+        "result": json.loads(row["result_json"]) if row["result_json"] else None,
+        "note": row["note"],
+        "subscription": subscription_view(conn, sub) if sub is not None else None,
+    }
+
+
+def open_rebuild_order(
+    conn: sqlite3.Connection,
+    subscription_name: str,
+    new_slot_name: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """开重建单：以当前 WAL 边界为全量快照位点，新建逻辑槽从该位点起保留 WAL。
+
+    前置条件：订阅处于 stalled，其绑定的逻辑槽 wal_status='lost'。同一订阅
+    最多一单在办。原订阅保持停顿与原绑定，直到回执位点吻合后原子换绑。
+    """
+    now = db.utc_now()
+    with _WRITE_LOCK, db.transaction(conn):
+        sub = conn.execute(
+            "SELECT * FROM subscriptions WHERE name = ?", (subscription_name,)
+        ).fetchone()
+        if sub is None:
+            raise NotFound(f"订阅 {subscription_name} 不存在")
+        if sub["status"] != "stalled":
+            raise Conflict(
+                "subscription_not_stalled",
+                f"订阅 {subscription_name} 状态为 {sub['status']}，只有停顿（stalled）的订阅可以开重建单",
+            )
+        source = conn.execute(
+            "SELECT * FROM slots WHERE name = ?", (sub["slot_name"],)
+        ).fetchone()
+        if source is None:
+            raise Conflict("slot_missing", f"订阅绑定的槽 {sub['slot_name']} 不存在")
+        if source["slot_type"] != "logical":
+            raise Conflict("slot_not_logical", "只有逻辑槽可以开重建单")
+        if source["wal_status"] != "lost":
+            raise Conflict(
+                "slot_not_lost",
+                f"槽 {source['name']} 的 wal_status 为 {source['wal_status']}，不是 lost，不能开重建单",
+            )
+        if _open_order_for_subscription(conn, subscription_name) is not None:
+            raise Conflict(
+                "rebuild_order_exists",
+                f"订阅 {subscription_name} 已有在办重建单，同一订阅最多一单在办",
+            )
+        if conn.execute("SELECT 1 FROM slots WHERE name = ?", (new_slot_name,)).fetchone():
+            raise Conflict("slot_exists", f"槽 {new_slot_name} 已存在，新槽名必须未被占用")
+
+        boundary = int(
+            conn.execute("SELECT wal_boundary_lsn FROM cluster WHERE id = 1").fetchone()["wal_boundary_lsn"]
+        )
+        order_id = f"rb-{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO slots (name, slot_type, restart_lsn, confirmed_flush_lsn, active, disabled,
+                               wal_status, plugin, note, updated_at)
+            VALUES (?, 'logical', ?, ?, 0, 0, 'reserved', ?, ?, ?)
+            """,
+            (
+                new_slot_name,
+                boundary,
+                boundary,
+                source["plugin"],
+                f"重建单 {order_id} 为订阅 {subscription_name} 新建，自快照位点起保留 WAL",
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rebuild_orders
+                (id, subscription_name, source_slot_name, new_slot_name, snapshot_lsn,
+                 status, created_at, note)
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+            """,
+            (order_id, subscription_name, source["name"], new_slot_name, boundary, now, note),
+        )
+        db.bump_revision(conn, now)
+        db.record_event(
+            conn,
+            "rebuild_order_opened",
+            detail={
+                "order_id": order_id,
+                "subscription": subscription_name,
+                "source_slot": source["name"],
+                "new_slot": new_slot_name,
+                "snapshot_lsn": format_lsn(boundary),
+            },
+            at=now,
+        )
+        return _rebuild_order_view(conn, _rebuild_order_row(conn, order_id))
+
+
+def list_rebuild_orders(
+    conn: sqlite3.Connection, status: str | None = None, limit: int = 50
+) -> list[dict[str, Any]]:
+    if status is not None:
+        rows = conn.execute(
+            "SELECT * FROM rebuild_orders WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM rebuild_orders ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [_rebuild_order_view(conn, row) for row in rows]
+
+
+def get_rebuild_order(conn: sqlite3.Connection, order_id: str) -> dict[str, Any]:
+    return _rebuild_order_view(conn, _rebuild_order_row(conn, order_id))
+
+
+def submit_rebuild_receipt(
+    conn: sqlite3.Connection,
+    order_id: str,
+    snapshot_lsn: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """提交模拟复制完成的回执。
+
+    位点吻合：单事务内原子换绑（订阅指向新槽、按快照位点恢复在线）、结单，
+    原槽留在库存。位点不符：只记录重报次数，单仍在办，可重报。已结单
+    （completed）的回执幂等返回，不再改动库存。
+    """
+    reported = parse_lsn(snapshot_lsn)
+    with _WRITE_LOCK:
+        row = _rebuild_order_row(conn, order_id)
+        if row["status"] == "completed":
+            # 结单后的回执不再改动库存：幂等回放已存结果。
+            return {"ok": True, "already_closed": True, "order": _rebuild_order_view(conn, row)}
+        if row["status"] != "open":
+            raise Conflict(
+                "rebuild_order_not_open",
+                f"重建单状态为 {row['status']}，回执不再改动库存",
+            )
+
+        now = db.utc_now()
+        mismatch: Conflict | None = None
+        with db.transaction(conn):
+            row = _rebuild_order_row(conn, order_id)
+            if row["status"] != "open":
+                raise Conflict(
+                    "rebuild_order_not_open",
+                    f"重建单状态为 {row['status']}，回执不再改动库存",
+                )
+            expected = int(row["snapshot_lsn"])
+            if reported != expected:
+                conn.execute(
+                    "UPDATE rebuild_orders SET mismatch_count = mismatch_count + 1 WHERE id = ?",
+                    (order_id,),
+                )
+                db.record_event(
+                    conn,
+                    "rebuild_receipt_mismatch",
+                    detail={
+                        "order_id": order_id,
+                        "expected_snapshot_lsn": format_lsn(expected),
+                        "reported_lsn": format_lsn(reported),
+                    },
+                    at=now,
+                )
+                mismatch = Conflict(
+                    "snapshot_mismatch",
+                    "回执位点与开单快照位点不符，重建单仍在办，可重报",
+                    expected_snapshot_lsn=format_lsn(expected),
+                    reported_lsn=format_lsn(reported),
+                )
+            else:
+                # 原子换绑：订阅指向新槽并按快照位点恢复在线；新槽转为
+                # active；原槽留在库存（lost，等待后续清理流程）；结单。
+                conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET slot_name = ?, status = 'online', confirmed_lsn = ?, updated_at = ?
+                    WHERE name = ?
+                    """,
+                    (row["new_slot_name"], expected, now, row["subscription_name"]),
+                )
+                conn.execute(
+                    "UPDATE slots SET active = 1, updated_at = ? WHERE name = ?",
+                    (now, row["new_slot_name"]),
+                )
+                result = {
+                    "rebound_subscription": row["subscription_name"],
+                    "new_slot_name": row["new_slot_name"],
+                    "source_slot_retained": row["source_slot_name"],
+                    "resumed_at_lsn": format_lsn(expected),
+                    "completed_at": now,
+                    "note": note,
+                }
+                conn.execute(
+                    """
+                    UPDATE rebuild_orders
+                    SET status = 'completed', closed_at = ?, receipt_lsn = ?, result_json = ?
+                    WHERE id = ?
+                    """,
+                    (now, expected, json.dumps(result, ensure_ascii=False), order_id),
+                )
+                db.bump_revision(conn, now)
+                db.record_event(
+                    conn,
+                    "rebuild_order_completed",
+                    detail={
+                        "order_id": order_id,
+                        "subscription": row["subscription_name"],
+                        "new_slot": row["new_slot_name"],
+                        "source_slot_retained": row["source_slot_name"],
+                        "snapshot_lsn": format_lsn(expected),
+                    },
+                    at=now,
+                )
+        if mismatch is not None:
+            raise mismatch
+        return {
+            "ok": True,
+            "already_closed": False,
+            "order": _rebuild_order_view(conn, _rebuild_order_row(conn, order_id)),
+        }
+
+
+def abort_rebuild_order(
+    conn: sqlite3.Connection, order_id: str, note: str | None = None
+) -> dict[str, Any]:
+    """中止重建单：释放新槽，原订阅继续停顿、保留原绑定与确认位点。"""
+    now = db.utc_now()
+    with _WRITE_LOCK:
+        row = _rebuild_order_row(conn, order_id)
+        if row["status"] == "aborted":
+            return {"ok": True, "already_aborted": True, "order": _rebuild_order_view(conn, row)}
+        if row["status"] != "open":
+            raise Conflict(
+                "rebuild_order_not_open",
+                f"重建单状态为 {row['status']}，不能中止",
+            )
+        with db.transaction(conn):
+            row = _rebuild_order_row(conn, order_id)
+            if row["status"] != "open":
+                raise Conflict(
+                    "rebuild_order_not_open",
+                    f"重建单状态为 {row['status']}，不能中止",
+                )
+            bound = conn.execute(
+                "SELECT name FROM subscriptions WHERE slot_name = ?", (row["new_slot_name"],)
+            ).fetchall()
+            if bound:
+                raise Conflict(
+                    "rebuild_slot_still_bound",
+                    "新槽仍被订阅绑定，不能释放",
+                    subscriptions=[b["name"] for b in bound],
+                )
+            conn.execute("DELETE FROM slots WHERE name = ?", (row["new_slot_name"],))
+            result = {
+                "released_slot": row["new_slot_name"],
+                "subscription_kept_stalled": row["subscription_name"],
+                "aborted_at": now,
+                "note": note,
+            }
+            conn.execute(
+                "UPDATE rebuild_orders SET status = 'aborted', closed_at = ?, result_json = ? WHERE id = ?",
+                (now, json.dumps(result, ensure_ascii=False), order_id),
+            )
+            db.bump_revision(conn, now)
+            db.record_event(
+                conn,
+                "rebuild_order_aborted",
+                detail={
+                    "order_id": order_id,
+                    "subscription": row["subscription_name"],
+                    "released_slot": row["new_slot_name"],
+                },
+                at=now,
+            )
+        return {
+            "ok": True,
+            "already_aborted": False,
+            "order": _rebuild_order_view(conn, _rebuild_order_row(conn, order_id)),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -488,11 +861,17 @@ def _eligibility_for(conn: sqlite3.Connection, snapshot: dict[str, Any], slot_na
     from .analysis import slot_view, subscriptions_by_slot
 
     grouped = subscriptions_by_slot(snapshot)
+    rebuild_map = rebuild_slot_map(conn)
     blocked: list[dict[str, Any]] = []
     for slot in snapshot["slots"]:
         if slot["name"] not in slot_names:
             continue
-        view = slot_view(slot, snapshot["wal_boundary_lsn"], grouped.get(slot["name"], []))
+        view = slot_view(
+            slot,
+            snapshot["wal_boundary_lsn"],
+            grouped.get(slot["name"], []),
+            rebuild=rebuild_map.get(slot["name"]),
+        )
         if not view["eligible"]:
             blocked.append({"slot": slot["name"], "blocking_reasons": view["blocking_reasons"]})
     return blocked
@@ -831,6 +1210,20 @@ def state_document(conn: sqlite3.Connection) -> dict[str, Any]:
             "crash_before_commit_armed": STALL_KEY_PREFIX in state,
         },
         "pending_cleanup": pending_cleanup_map(conn),
+        "rebuild_slots": rebuild_slot_map(conn),
+        "rebuild_orders_open": [
+            {
+                "id": row["id"],
+                "subscription_name": row["subscription_name"],
+                "source_slot_name": row["source_slot_name"],
+                "new_slot_name": row["new_slot_name"],
+                "snapshot_lsn": format_lsn(int(row["snapshot_lsn"])),
+                "created_at": int(row["created_at"]),
+            }
+            for row in conn.execute(
+                "SELECT * FROM rebuild_orders WHERE status = 'open' ORDER BY created_at, id"
+            ).fetchall()
+        ],
         "events": [
             {
                 "at": row["at"],

@@ -64,6 +64,26 @@ CREATE TABLE IF NOT EXISTS previews (
 CREATE INDEX IF NOT EXISTS idx_previews_status ON previews(status);
 CREATE INDEX IF NOT EXISTS idx_previews_created ON previews(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS rebuild_orders (
+    id TEXT PRIMARY KEY,
+    subscription_name TEXT NOT NULL,
+    source_slot_name TEXT NOT NULL,
+    new_slot_name TEXT NOT NULL,
+    snapshot_lsn INTEGER NOT NULL CHECK (snapshot_lsn >= 0),
+    status TEXT NOT NULL CHECK (status IN ('open', 'completed', 'aborted')),
+    created_at INTEGER NOT NULL,
+    closed_at INTEGER,
+    mismatch_count INTEGER NOT NULL DEFAULT 0 CHECK (mismatch_count >= 0),
+    receipt_lsn INTEGER,
+    result_json TEXT,
+    note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_rebuild_orders_status ON rebuild_orders(status);
+-- 同一订阅最多一单在办（数据库层兜底，业务层另有友好报错）。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rebuild_orders_open_subscription
+    ON rebuild_orders(subscription_name) WHERE status = 'open';
+
 CREATE TABLE IF NOT EXISTS demo_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -209,6 +229,20 @@ SEED_SLOTS = [
         "plugin": None,
         "note": "只读备库物理槽，仍在使用",
     },
+    # Logical slot whose WAL fell behind the keep limit and was invalidated
+    # (wal_status='lost'); its subscription is stalled waiting for a rebuild
+    # order.  This is the entry point of the rebuild drill.
+    {
+        "name": "slot_reports",
+        "slot_type": "logical",
+        "restart_lsn": 0x1600000,  # boundary - 10 MiB
+        "confirmed_flush_lsn": 0x1A00000,
+        "active": 0,
+        "disabled": 0,
+        "wal_status": "lost",
+        "plugin": "pgoutput",
+        "note": "报表订阅槽，WAL 已丢失（lost），等待重建单",
+    },
 ]
 
 SEED_SUBSCRIPTIONS = [
@@ -233,6 +267,13 @@ SEED_SUBSCRIPTIONS = [
         "confirmed_lsn": 0x1F00000,
         "note": "已停用；清理 slot_legacy 时会被解绑",
     },
+    {
+        "name": "sub_reports",
+        "slot_name": "slot_reports",
+        "status": "stalled",
+        "confirmed_lsn": 0x1A00000,
+        "note": "报表订阅，槽 WAL 丢失后停顿，等待重建单",
+    },
 ]
 
 
@@ -252,6 +293,7 @@ def seed(conn: sqlite3.Connection, *, reset: bool = False) -> None:
         if reset:
             conn.execute("DELETE FROM previews")
             conn.execute("DELETE FROM events")
+            conn.execute("DELETE FROM rebuild_orders")
             conn.execute("DELETE FROM subscriptions")
             conn.execute("DELETE FROM slots")
             conn.execute("DELETE FROM demo_state")

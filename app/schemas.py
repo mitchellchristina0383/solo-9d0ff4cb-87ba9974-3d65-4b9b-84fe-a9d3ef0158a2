@@ -177,3 +177,52 @@ class PreviewConfirmRequest(StrictModel):
     @classmethod
     def _note(cls, value: str | None) -> str | None:
         return value or None
+
+
+class RebuildOrderCreate(StrictModel):
+    """开重建单：为停顿订阅的 lost 逻辑槽新建一个逻辑槽。"""
+
+    subscription_name: str = Field(description="停顿（stalled）且绑定 lost 逻辑槽的订阅名")
+    new_slot_name: str = Field(description="新建逻辑槽名，必须未被占用")
+    note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("subscription_name")
+    @classmethod
+    def _sub(cls, value: str) -> str:
+        return _check_name(value, "订阅名")
+
+    @field_validator("new_slot_name")
+    @classmethod
+    def _slot(cls, value: str) -> str:
+        return _check_name(value, "新槽名")
+
+    @field_validator("note")
+    @classmethod
+    def _note(cls, value: str | None) -> str | None:
+        return value or None
+
+
+class RebuildReceiptRequest(StrictModel):
+    """模拟复制完成的回执：位点必须与开单时的快照位点吻合。"""
+
+    snapshot_lsn: str = Field(description="回执上报的全量快照位点，例如 0/2000000")
+    note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("snapshot_lsn")
+    @classmethod
+    def _lsn(cls, value: str) -> str:
+        return _lsn_value(value)
+
+    @field_validator("note")
+    @classmethod
+    def _note(cls, value: str | None) -> str | None:
+        return value or None
+
+
+class RebuildAbortRequest(StrictModel):
+    note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("note")
+    @classmethod
+    def _note(cls, value: str | None) -> str | None:
+        return value or None
